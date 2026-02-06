@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npx tsx:*)",
+      "Bash(npx prisma generate:*)",
+      "Bash(node --experimental-strip-types --experimental-transform-types --no-warnings prisma/seed.ts:*)"
+    ]
+  }
+}

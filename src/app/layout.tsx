@@ -1,5 +1,6 @@
 import './globals.css'
 import type { Metadata } from 'next'
+import Providers from './providers'
 
 export const metadata: Metadata = {
   title: 'Petrol-IA | Industrial Cybersecurity Hub',
@@ -14,9 +15,11 @@ export default function RootLayout({
   return (
     <html lang="es">
       <body>
-        <main className="min-h-screen flex flex-col">
-          {children}
-        </main>
+        <Providers>
+          <main className="min-h-screen flex flex-col">
+            {children}
+          </main>
+        </Providers>
       </body>
     </html>
   )

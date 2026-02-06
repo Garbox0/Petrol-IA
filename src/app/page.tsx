@@ -1,264 +1,590 @@
-'use client';
+'use client'
 
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useCallback } from 'react'
+import { useSession, signOut } from 'next-auth/react'
+
+interface Threat {
+  id: string
+  type: string
+  description: string
+  severity: string
+  status: string
+  sourceIp: string
+  targetAsset: string
+  protocol: string | null
+  riskAnalysis: string | null
+  detectedAt: string
+  mitigatedAt: string | null
+  mitigatedBy: { id: string; name: string } | null
+  contractor: { id: string; name: string } | null
+}
+
+interface ContractorInfo {
+  id: string
+  name: string
+  healthScore: number
+  status: string
+  riskLevel: string
+}
+
+interface DashboardStats {
+  activeThreats: number
+  totalThreats: number
+  openIncidents: number
+  vendorHealth: number
+  contractors: ContractorInfo[]
+  recentActivity: any[]
+  mitigatedToday: number
+}
+
+interface LogEntry {
+  time: string
+  msg: string
+  type: string
+}
 
 export default function Dashboard() {
-  const [step, setStep] = useState(0); // 0: Idle, 1: Denied, 2: Fixed, 3: Requested, 4: Active
-  const [logs, setLogs] = useState([
-    { time: '20:47', msg: 'Sistema SOC Inicializado.', type: 'system' }
-  ]);
+  const { data: session } = useSession()
+  const [activeTab, setActiveTab] = useState('summary')
+  const [threats, setThreats] = useState<Threat[]>([])
+  const [stats, setStats] = useState<DashboardStats | null>(null)
+  const [selectedThreat, setSelectedThreat] = useState<Threat | null>(null)
+  const [networkData, setNetworkData] = useState<number[]>([])
+  const [isScanning, setIsScanning] = useState(false)
+  const [logs, setLogs] = useState<LogEntry[]>([
+    { time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), msg: 'Sistema SOC Inicializado.', type: 'system' }
+  ])
 
-  const addLog = (msg: string, type: string = 'system') => {
-    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    setLogs(prev => [{ time, msg, type }, ...prev].slice(0, 5));
-  };
+  // JIT workflow state
+  const [jitStep, setJitStep] = useState(0)
 
-  const runWorkflow = () => {
-    if (step === 0) {
-      setStep(1);
-      addLog('Acceso Denegado: PetroServicios S.A. (Score < 70%)', 'alert');
-    } else if (step === 1) {
-      setStep(2);
-      addLog('Parches Aplicados: PetroServicios Score -> 95%', 'system');
-    } else if (step === 2) {
-      setStep(3);
-      addLog('Solicitud JIT Enviada: Acceso a SCADA-04 (2h)', 'system');
-    } else if (step === 3) {
-      setStep(4);
-      addLog('Acceso JIT Aprobado por: Ing. Martínez (Supervisor)', 'system');
-    } else {
-      setStep(0);
-      addLog('Sesión JIT Terminada automáticamente.', 'alert');
+  const addLog = useCallback((msg: string, type: string = 'system') => {
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    setLogs(prev => [{ time, msg, type }, ...prev].slice(0, 10))
+  }, [])
+
+  // Fetch amenazas reales de la DB
+  const fetchThreats = useCallback(async () => {
+    try {
+      const res = await fetch('/api/threats?limit=30')
+      if (res.ok) {
+        const data = await res.json()
+        setThreats(data)
+      }
+    } catch (e) {
+      console.error('Error fetching threats:', e)
     }
-  };
+  }, [])
+
+  // Fetch stats del dashboard
+  const fetchStats = useCallback(async () => {
+    try {
+      const res = await fetch('/api/dashboard/stats')
+      if (res.ok) {
+        const data = await res.json()
+        setStats(data)
+      }
+    } catch (e) {
+      console.error('Error fetching stats:', e)
+    }
+  }, [])
+
+  // Fetch trafico de red real
+  const fetchTraffic = useCallback(async () => {
+    try {
+      const res = await fetch('/api/network/traffic')
+      const traffic = await res.json()
+      if (!traffic.error && Array.isArray(traffic)) {
+        const chartValues = traffic.map((c: any) => (c.localPort % 100))
+        setNetworkData(prev => [...prev.slice(-10), ...chartValues].slice(-26))
+      }
+    } catch (e) {
+      // Silenciar error de red en non-Windows
+    }
+  }, [])
+
+  // Polling de threat intel real
+  const fetchThreatIntel = useCallback(async () => {
+    try {
+      const res = await fetch('/api/threat-intel')
+      const intel = await res.json()
+      if (intel.feed && intel.feed.length > 0) {
+        const ioc = intel.feed[Math.floor(Math.random() * intel.feed.length)]
+
+        // Crear amenaza real en la DB
+        const createRes = await fetch('/api/threats', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: ioc.type || 'IOC Detected',
+            description: ioc.description || `IOC detectado desde feed de inteligencia: ${ioc.source}`,
+            severity: ioc.severity || 'high',
+            sourceIp: ioc.source,
+            targetAsset: ioc.target || 'Edge-Firewall',
+            protocol: 'TCP',
+          }),
+        })
+
+        if (createRes.ok) {
+          addLog(`IOC Detectado: ${ioc.source}`, 'alert')
+          fetchThreats()
+        }
+      }
+    } catch (e) {
+      console.error('Error fetching threat intel:', e)
+    }
+  }, [addLog, fetchThreats])
+
+  // Polling principal
+  useEffect(() => {
+    fetchThreats()
+    fetchStats()
+    fetchTraffic()
+
+    const interval = setInterval(() => {
+      fetchThreats()
+      fetchStats()
+      fetchTraffic()
+
+      // Threat intel cada ~20 segundos (cuando estamos en SOC tab)
+      if (activeTab === 'soc' && Math.random() > 0.5) {
+        fetchThreatIntel()
+      }
+    }, 6000)
+
+    return () => clearInterval(interval)
+  }, [activeTab, fetchThreats, fetchStats, fetchTraffic, fetchThreatIntel])
+
+  // Mitigar amenaza REAL
+  const mitigateThreat = async (id: string) => {
+    try {
+      const res = await fetch(`/api/threats/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'mitigated' }),
+      })
+
+      if (res.ok) {
+        addLog('Amenaza mitigada y registrada en base de datos.', 'system')
+        fetchThreats()
+        fetchStats()
+      }
+    } catch (e) {
+      addLog('Error al mitigar amenaza.', 'alert')
+    }
+  }
+
+  // Escaneo de red
+  const runScan = async () => {
+    setIsScanning(true)
+    addLog('Creando Job de escaneo en el Hub...', 'system')
+    try {
+      const res = await fetch('/api/network/scan', { method: 'POST' })
+      const data = await res.json()
+      const jobId = data.jobId
+      if (!jobId) throw new Error('No se pudo crear el Job')
+
+      addLog(`Job [${jobId}] creado. Esperando al Conector...`, 'system')
+
+      const pollInterval = setInterval(async () => {
+        const checkRes = await fetch(`/api/jobs?id=${jobId}`)
+        const job = await checkRes.json()
+
+        if (job.status === 'completed') {
+          clearInterval(pollInterval)
+          setIsScanning(false)
+          addLog('Escaneo finalizado por el Conector.', 'system')
+          if (job.result?.hosts) {
+            addLog(`${job.result.hosts.length} hosts detectados en red local.`, 'system')
+          }
+        } else if (job.status === 'failed') {
+          clearInterval(pollInterval)
+          setIsScanning(false)
+          addLog('Error: El conector falló en la ejecución del Job.', 'alert')
+        }
+      }, 2000)
+    } catch (e) {
+      addLog('Error al contactar con el Hub.', 'alert')
+      setIsScanning(false)
+    }
+  }
+
+  // JIT workflow
+  const runWorkflow = () => {
+    if (jitStep === 0) {
+      setJitStep(1)
+      addLog('Acceso Denegado: PetroServicios S.A. (Score < 70%)', 'alert')
+    } else if (jitStep === 1) {
+      setJitStep(2)
+      addLog('Parches Aplicados: PetroServicios Score -> 95%', 'system')
+    } else if (jitStep === 2) {
+      setJitStep(3)
+      addLog('Solicitud JIT Enviada: Acceso a SCADA-04 (2h)', 'system')
+    } else if (jitStep === 3) {
+      setJitStep(4)
+      addLog('Acceso JIT Aprobado por: Ing. Martínez (Supervisor)', 'system')
+    } else {
+      setJitStep(0)
+      addLog('Sesión JIT Terminada automáticamente.', 'alert')
+    }
+  }
+
+  const activeThreats = threats.filter(t => t.status !== 'mitigated' && t.status !== 'resolved' && t.status !== 'false_positive')
+  const mitigatedThreats = threats.filter(t => t.status === 'mitigated' || t.status === 'resolved')
+
+  const severityColor = (s: string) => {
+    if (s === 'critical' || s === 'high') return '#ef4444'
+    if (s === 'medium') return 'var(--accent-orange)'
+    return 'var(--accent-blue)'
+  }
 
   return (
     <div className="dashboard-container" style={{ padding: '2rem', maxWidth: '1400px', margin: '0 auto', width: '100%' }}>
-      {/* Header Section */}
-      <header style={{ marginBottom: '3rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      {/* Header */}
+      <header style={{ marginBottom: '2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
           <h1 className="text-gradient" style={{ fontSize: '2.5rem', marginBottom: '0.5rem' }}>Petrol-IA</h1>
           <p style={{ opacity: 0.6, fontSize: '0.9rem', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
             SaaS de Gobernanza de Terceros & Zero Trust
           </p>
         </div>
-        <div className="glass" style={{ padding: '0.75rem 1.5rem', display: 'flex', alignItems: 'center', gap: '1rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center' }}>
-            <span className="status-ring status-online pulse-icon"></span>
-            <span style={{ fontSize: '0.8rem', fontWeight: 500 }}>Consola de Licencia: Activa</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+          <div className="glass" style={{ padding: '0.75rem 1.5rem', display: 'flex', alignItems: 'center', gap: '1rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center' }}>
+              <span className="status-ring status-online pulse-icon"></span>
+              <span style={{ fontSize: '0.8rem', fontWeight: 500 }}>SOC Activo</span>
+            </div>
+            <div style={{ width: '1px', height: '20px', background: 'var(--border-color)' }}></div>
+            <div style={{ fontSize: '0.8rem', opacity: 0.8 }}>Cuenca Neuquina</div>
           </div>
-          <div style={{ width: '1px', height: '20px', background: 'var(--border-color)' }}></div>
-          <div style={{ fontSize: '0.8rem', opacity: 0.8 }}>Operadora: Vaca Muerta North</div>
+          <div className="glass" style={{ padding: '0.75rem 1.25rem', display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+            <span style={{ fontSize: '0.8rem', opacity: 0.7 }}>{session?.user?.name}</span>
+            <button
+              onClick={() => signOut()}
+              style={{ padding: '0.3rem 0.6rem', background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '4px', color: '#ef4444', fontSize: '0.7rem', cursor: 'pointer' }}
+            >
+              SALIR
+            </button>
+          </div>
         </div>
       </header>
 
-      {/* Hero Stats */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '1.5rem', marginBottom: '3rem' }}>
-        <div className="glass cyber-border" style={{ padding: '2rem' }}>
-          <h3 style={{ fontSize: '0.8rem', opacity: 0.6, marginBottom: '1rem', textTransform: 'uppercase' }}>Vendor Health Index</h3>
-          <div style={{ fontSize: '2.5rem', fontWeight: 700, marginBottom: '0.5rem' }}>94%</div>
-          <div style={{ fontSize: '0.85rem', color: 'var(--accent-green)' }}>↑ 2.4% Cumplimiento Global</div>
-        </div>
+      {/* Tabs */}
+      <nav className="tabs-header" aria-label="Navegación del Dashboard">
+        {[
+          { key: 'summary', label: 'VISTA GENERAL' },
+          { key: 'soc', label: 'SOC DE DETECCIÓN' },
+          { key: 'jit', label: 'ACCESO JIT' },
+          { key: 'reports', label: 'REPORTES' },
+        ].map(tab => (
+          <button
+            key={tab.key}
+            className={`tab-btn ${activeTab === tab.key ? 'active' : ''}`}
+            onClick={() => setActiveTab(tab.key)}
+            aria-selected={activeTab === tab.key}
+            role="tab"
+          >
+            {tab.label}
+          </button>
+        ))}
+      </nav>
 
-        <div className="glass cyber-border" style={{ padding: '2rem' }}>
-          <h3 style={{ fontSize: '0.8rem', opacity: 0.6, marginBottom: '1rem', textTransform: 'uppercase' }}>Licencias Activas JIT</h3>
-          <div style={{ fontSize: '2.5rem', fontWeight: 700, marginBottom: '0.5rem' }}>{step === 4 ? 13 : 12}</div>
-          <div style={{ fontSize: '0.85rem', opacity: 0.8 }}>Consumo de cuota: 15%</div>
+      {/* Stats Bar */}
+      <div role="region" aria-label="Estadísticas Clave" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: '1.5rem', marginBottom: '2rem' }}>
+        <div className="glass cyber-border" style={{ padding: '1.5rem' }}>
+          <h3 style={{ fontSize: '0.7rem', opacity: 0.6, marginBottom: '0.5rem', textTransform: 'uppercase' }}>Amenazas Activas</h3>
+          <div style={{ fontSize: '2rem', fontWeight: 700, color: (stats?.activeThreats || 0) > 0 ? '#ef4444' : 'var(--accent-green)' }}>
+            {stats?.activeThreats ?? '-'}
+          </div>
         </div>
-
-        <div className="glass cyber-border" style={{ padding: '2rem' }}>
-          <h3 style={{ fontSize: '0.8rem', opacity: 0.6, marginBottom: '1rem', textTransform: 'uppercase' }}>Acciones Ejecutadas</h3>
-          <div style={{ fontSize: '2.5rem', fontWeight: 700, marginBottom: '0.5rem' }}>1,242</div>
-          <div style={{ fontSize: '0.85rem', opacity: 0.8 }}>Bloqueos automáticos (24h)</div>
+        <div className="glass cyber-border" style={{ padding: '1.5rem' }}>
+          <h3 style={{ fontSize: '0.7rem', opacity: 0.6, marginBottom: '0.5rem', textTransform: 'uppercase' }}>Incidentes Abiertos</h3>
+          <div style={{ fontSize: '2rem', fontWeight: 700, color: (stats?.openIncidents || 0) > 0 ? 'var(--accent-orange)' : 'var(--accent-green)' }}>
+            {stats?.openIncidents ?? '-'}
+          </div>
+        </div>
+        <div className="glass cyber-border" style={{ padding: '1.5rem' }}>
+          <h3 style={{ fontSize: '0.7rem', opacity: 0.6, marginBottom: '0.5rem', textTransform: 'uppercase' }}>Vendor Health</h3>
+          <div style={{ fontSize: '2rem', fontWeight: 700 }}>{stats?.vendorHealth ?? '-'}%</div>
+        </div>
+        <div className="glass cyber-border" style={{ padding: '1.5rem' }}>
+          <h3 style={{ fontSize: '0.7rem', opacity: 0.6, marginBottom: '0.5rem', textTransform: 'uppercase' }}>Mitigadas Hoy</h3>
+          <div style={{ fontSize: '2rem', fontWeight: 700, color: 'var(--accent-green)' }}>{stats?.mitigatedToday ?? '-'}</div>
         </div>
       </div>
 
-      {/* Main Content Area */}
-      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '1.5rem' }}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-          {/* SOC Console: Real-time Monitor */}
-          <section className="glass grid-bg" style={{ padding: '2rem', minHeight: '300px', position: 'relative', overflow: 'hidden' }}>
-            <div className="scan-line"></div>
-            <div style={{ position: 'relative', zIndex: 1 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '2rem' }}>
-                <div>
-                  <h2 style={{ fontSize: '1.1rem', marginBottom: '0.25rem' }}>SOC Console | Nodo Central Vaca Muerta</h2>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                    <div className="status-ring status-online pulse-icon" style={{ margin: 0 }}></div>
-                    <span style={{ fontSize: '0.75rem', opacity: 0.6 }}>MONITOREO DE LICENCIAS ACTIVAS</span>
-                  </div>
-                </div>
-                <div style={{ display: 'flex', gap: '2rem' }}>
-                  <div style={{ textAlign: 'right' }}>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.5 }}>LATENCIA EDGE</div>
-                    <div style={{ fontSize: '1rem', fontWeight: 600, color: 'var(--accent-blue)' }}>12ms</div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Traffic Mockup Visual */}
-              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '4px', height: '100px', marginBottom: '1.5rem' }}>
-                {[40, 65, 30, 85, 45, 90, 70, 50, 60, 80, 45, 55, 75, 95, 40, 60, 85, 50, 45, 70, 60, 55, 90, 30, 40, 65].map((h, i) => (
-                  <div key={i} style={{
-                    flex: 1,
-                    height: `${h}%`,
-                    background: i === 22 ? 'var(--accent-orange)' : 'var(--accent-blue)',
-                    opacity: 0.3 + (h / 150),
-                    borderRadius: '2px 2px 0 0'
-                  }}></div>
+      {/* ═══════════ VISTA GENERAL ═══════════ */}
+      {activeTab === 'summary' && (
+        <div role="tabpanel" style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '1.5rem' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+            <section className="glass grid-bg" style={{ padding: '2rem', minHeight: '300px', position: 'relative', overflow: 'hidden' }}>
+              <div className="scan-line" aria-hidden="true"></div>
+              <h2 style={{ fontSize: '1.1rem', marginBottom: '1.5rem' }}>Estado de Red Operativa (Live Data)</h2>
+              <div role="img" aria-label="Gráfico de tráfico de red" style={{ display: 'flex', alignItems: 'flex-end', gap: '4px', height: '120px' }}>
+                {networkData.map((h, i) => (
+                  <div key={i} style={{ flex: 1, height: `${h}%`, background: 'var(--accent-blue)', opacity: 0.3 + (h / 150), borderRadius: '2px 2px 0 0', transition: 'all 0.5s ease' }}></div>
                 ))}
+                {networkData.length === 0 && (
+                  <div style={{ flex: 1, textAlign: 'center', opacity: 0.3, paddingTop: '3rem' }}>Esperando datos de red...</div>
+                )}
               </div>
+            </section>
 
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem' }}>
-                <div className="glass" style={{ padding: '0.75rem', background: 'rgba(255,255,255,0.02)' }}>
-                  <div style={{ fontSize: '0.65rem', opacity: 0.5, marginBottom: '0.25rem' }}>PROVEEDORES CONECTADOS</div>
-                  <div style={{ fontSize: '0.9rem' }}>42</div>
-                </div>
-                <div className="glass" style={{ padding: '0.75rem', background: 'rgba(255,255,255,0.02)' }}>
-                  <div style={{ fontSize: '0.65rem', opacity: 0.5, marginBottom: '0.25rem' }}>RECURSOS PROTEGIDOS</div>
-                  <div style={{ fontSize: '0.9rem' }}>1,204 PLCs</div>
-                </div>
-                <div className="glass" style={{ padding: '0.75rem', background: 'rgba(255,255,255,0.02)' }}>
-                  <div style={{ fontSize: '0.65rem', opacity: 0.5, marginBottom: '0.25rem' }}>LICENCIAS SaaS</div>
-                  <div style={{ fontSize: '0.9rem' }}>B2B Enterprise</div>
-                </div>
-              </div>
-            </div>
-          </section>
-
-          {/* Market Intelligence / Risk Context */}
-          <section className="glass cyber-border" style={{ padding: '1.5rem', background: 'rgba(239, 68, 68, 0.03)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-              <h2 style={{ fontSize: '0.9rem', color: '#ef4444', fontWeight: 700 }}>Inteligencia de Amenazas (CERT.ar)</h2>
-            </div>
-            <p style={{ fontSize: '0.85rem', lineHeight: '1.5', opacity: 0.9 }}>
-              El <strong>Phishing</strong> y <strong>Ransomware</strong> impulsados por IA son los vectores #1. Petrol-IA anula estas amenazas mediante el control de la cadena de suministro y protección de infraestructura crítica.
-            </p>
-          </section>
-
-          {/* Contratistas Table */}
-          <section className="glass" style={{ padding: '2rem' }}>
-            <h2 style={{ marginBottom: '1.5rem', fontSize: '1.25rem' }}>Estatus de Contratistas (SaaS Governance)</h2>
-            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-              <thead>
-                <tr style={{ textAlign: 'left', borderBottom: '1px solid var(--border-color)', fontSize: '0.8rem', opacity: 0.6 }}>
-                  <th style={{ paddingBottom: '1rem' }}>PROVEEDOR</th>
-                  <th style={{ paddingBottom: '1rem' }}>SCORE DE SALUD</th>
-                  <th style={{ paddingBottom: '1rem' }}>LICENCIA</th>
-                  <th style={{ paddingBottom: '1rem' }}>ACCIÓN</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[
-                  { name: 'TechWell Solutions', risk: 'Bajo', score: '98%', status: 'online' },
-                  { name: 'Neuquén Energética S.A.', risk: 'Medio', score: '82%', status: 'warning' },
-                  { name: 'Vaca Muerta Logistics', risk: 'Bajo', score: '95%', status: 'online' },
-                  { name: 'PetroServicios Global', risk: 'Alto', score: step >= 2 ? '95%' : '64%', status: step >= 2 ? 'online' : 'alert' },
-                ].map((vendor, i) => (
-                  <tr key={i} style={{ borderBottom: '1px solid var(--border-color)' }}>
-                    <td style={{ padding: '1.25rem 0', fontWeight: 500 }}>{vendor.name}</td>
-                    <td style={{ padding: '1.25rem 0' }}>
-                      <span style={{ color: vendor.status === 'alert' ? '#ef4444' : 'var(--accent-green)', fontWeight: 600 }}>{vendor.score}</span>
-                    </td>
-                    <td style={{ padding: '1.25rem 0', opacity: 0.8 }}>SaaS Basic</td>
-                    <td style={{ padding: '1.25rem 0' }}>
-                      <span className={`status-ring status-${vendor.status}`}></span>
-                      {vendor.status === 'alert' ? 'BLOQUEADO' : 'HABILITADO'}
-                    </td>
+            <section className="glass" style={{ padding: '1.5rem' }}>
+              <h2 style={{ marginBottom: '1rem', fontSize: '1.1rem' }}>Estatus de Contratistas</h2>
+              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', borderBottom: '1px solid var(--border-color)', fontSize: '0.75rem', opacity: 0.5 }}>
+                    <th scope="col" style={{ paddingBottom: '0.75rem' }}>PROVEEDOR</th>
+                    <th scope="col" style={{ paddingBottom: '0.75rem' }}>SCORE</th>
+                    <th scope="col" style={{ paddingBottom: '0.75rem' }}>RIESGO</th>
+                    <th scope="col" style={{ paddingBottom: '0.75rem' }}>ESTADO</th>
                   </tr>
+                </thead>
+                <tbody>
+                  {(stats?.contractors || []).map((c) => (
+                    <tr key={c.id} style={{ borderBottom: '1px solid var(--border-color)' }}>
+                      <td style={{ padding: '1rem 0', fontSize: '0.9rem' }}>{c.name}</td>
+                      <td style={{ padding: '1rem 0', color: c.healthScore < 70 ? '#ef4444' : 'var(--accent-green)' }}>{c.healthScore}%</td>
+                      <td style={{ padding: '1rem 0', fontSize: '0.8rem', color: severityColor(c.riskLevel) }}>{c.riskLevel.toUpperCase()}</td>
+                      <td style={{ padding: '1rem 0', fontSize: '0.8rem' }}>{c.status.toUpperCase()}</td>
+                    </tr>
+                  ))}
+                  {(!stats?.contractors || stats.contractors.length === 0) && (
+                    <tr><td colSpan={4} style={{ padding: '2rem', textAlign: 'center', opacity: 0.4 }}>Sin contratistas registrados</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </section>
+          </div>
+
+          <aside style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+            <section className="glass" style={{ padding: '1.5rem' }}>
+              <h2 style={{ marginBottom: '1rem', fontSize: '1.1rem' }}>Alertas de Contexto</h2>
+              <article className="alert-card">
+                <h3 style={{ fontSize: '0.75rem', fontWeight: 700, marginBottom: '0.25rem' }}>INTELIGENCIA CERT.AR</h3>
+                <p style={{ fontSize: '0.8rem', opacity: 0.8 }}>Incremento del 13% en ataques al sector energético en Argentina.</p>
+              </article>
+            </section>
+
+            <section className="glass" style={{ padding: '1.5rem' }}>
+              <h2 style={{ marginBottom: '1rem', fontSize: '1.1rem' }}>Actividad Reciente</h2>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                {(stats?.recentActivity || []).slice(0, 5).map((a: any) => (
+                  <div key={a.id} style={{ fontSize: '0.75rem', padding: '0.5rem', borderLeft: '2px solid var(--accent-blue)', paddingLeft: '0.75rem' }}>
+                    <div style={{ fontWeight: 600 }}>{a.action}</div>
+                    <div style={{ opacity: 0.5 }}>{a.user?.name} - {new Date(a.createdAt).toLocaleTimeString()}</div>
+                  </div>
                 ))}
-              </tbody>
-            </table>
-          </section>
+                {(!stats?.recentActivity || stats.recentActivity.length === 0) && (
+                  <div style={{ opacity: 0.4, fontSize: '0.8rem' }}>Sin actividad reciente</div>
+                )}
+              </div>
+            </section>
+          </aside>
         </div>
+      )}
 
-        {/* WORKFLOW SIMULATOR (The Action Side) */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-          <section className="glass cyber-border" style={{ padding: '2rem', borderTop: '2px solid var(--accent-blue)' }}>
-            <h2 style={{ marginBottom: '1rem', fontSize: '1.1rem' }}>Workflow: Solicitud JIT</h2>
-            <p style={{ fontSize: '0.8rem', opacity: 0.6, marginBottom: '2rem' }}>
-              Demostración de cómo Petrol-IA <strong>ejecuta</strong> seguridad en tiempo real.
-            </p>
+      {/* ═══════════ SOC DE DETECCIÓN ═══════════ */}
+      {activeTab === 'soc' && (
+        <div role="tabpanel" style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '1.5rem', minHeight: 'calc(100vh - 380px)' }}>
+          <section className="glass" style={{ padding: '2rem', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <h2 style={{ marginBottom: '1.5rem', fontSize: '1.25rem' }}>Detección de Amenazas en Tiempo Real</h2>
 
-            {/* Stepper Visual */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', marginBottom: '2rem' }}>
-              {[
-                { id: 1, label: 'Intento de Acceso (Técnico)' },
-                { id: 2, label: 'Validación de Health-Passport' },
-                { id: 3, label: 'Solicitud de Acceso Temporal' },
-                { id: 4, label: 'Aprobación y Apertura Túnel' },
-              ].map((s) => (
-                <div key={s.id} style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '1rem',
-                  opacity: step >= s.id ? 1 : 0.3,
-                  transition: 'opacity 0.3s'
-                }}>
-                  <div style={{
-                    width: '24px',
-                    height: '24px',
-                    borderRadius: '50%',
-                    background: step >= s.id ? 'var(--accent-blue)' : 'var(--border-color)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: '0.7rem',
-                    fontWeight: 700
-                  }}>{s.id}</div>
-                  <span style={{ fontSize: '0.85rem' }}>{s.label}</span>
-                </div>
+            <div style={{ flex: 1, maxHeight: '480px', overflowY: 'auto', paddingRight: '1rem', display: 'flex', flexDirection: 'column', gap: '1rem', scrollbarWidth: 'thin', scrollbarColor: 'var(--accent-blue) transparent' }}>
+              <div style={{ fontSize: '0.75rem', opacity: 0.5, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.5rem' }}>
+                Incidentes Activos ({activeThreats.length})
+              </div>
+              {activeThreats.map((t) => (
+                <article key={t.id} className="glass" style={{ padding: '1.25rem', borderLeft: `4px solid ${severityColor(t.severity)}`, position: 'relative', flexShrink: 0 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+                    <h3 style={{ fontWeight: 700, fontSize: '0.9rem' }}>{t.type}</h3>
+                    <span style={{ fontSize: '0.7rem', opacity: 0.6 }}>
+                      {new Date(t.detectedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} | {t.status.toUpperCase()}
+                    </span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', fontSize: '0.8rem', opacity: 0.8 }}>
+                    <div>ORIGEN: <span style={{ color: severityColor(t.severity) }}>{t.sourceIp}</span></div>
+                    <div>DESTINO: <span className="threat-low">{t.targetAsset}</span></div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem' }}>
+                    <button
+                      onClick={() => mitigateThreat(t.id)}
+                      style={{ padding: '0.4rem 0.8rem', background: 'var(--accent-green)', color: 'white', border: 'none', borderRadius: '4px', fontSize: '0.7rem', cursor: 'pointer' }}
+                    >
+                      MITIGAR
+                    </button>
+                    <button
+                      onClick={() => setSelectedThreat(t)}
+                      style={{ padding: '0.4rem 0.8rem', background: 'rgba(255,255,255,0.1)', color: 'white', border: 'none', borderRadius: '4px', fontSize: '0.7rem', cursor: 'pointer' }}
+                    >
+                      DETALLES
+                    </button>
+                  </div>
+                </article>
               ))}
+              {activeThreats.length === 0 && (
+                <div style={{ textAlign: 'center', opacity: 0.4, padding: '2rem' }}>No hay amenazas activas. Red segura.</div>
+              )}
+            </div>
+
+            {/* Historial de mitigadas */}
+            <div style={{ marginTop: '2rem', borderTop: '1px solid var(--border-color)', paddingTop: '1.5rem' }}>
+              <div style={{ fontSize: '0.75rem', opacity: 0.5, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '1rem' }}>
+                Historial ({mitigatedThreats.length} mitigadas)
+              </div>
+              <div style={{ display: 'flex', gap: '1rem', overflowX: 'auto', paddingBottom: '1rem' }}>
+                {mitigatedThreats.slice(0, 10).map(t => (
+                  <div key={t.id} className="glass" style={{ minWidth: '200px', padding: '1rem', fontSize: '0.75rem', border: '1px solid var(--accent-green)', opacity: 0.7 }}>
+                    <div style={{ fontWeight: 700 }}>{t.type}</div>
+                    <div style={{ opacity: 0.6 }}>
+                      {t.mitigatedAt ? new Date(t.mitigatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '-'} | NEUTRALIZADO
+                    </div>
+                    {t.mitigatedBy && <div style={{ opacity: 0.5, marginTop: '0.25rem' }}>Por: {t.mitigatedBy.name}</div>}
+                  </div>
+                ))}
+              </div>
             </div>
 
             <button
-              onClick={runWorkflow}
-              style={{
-                width: '100%',
-                padding: '1rem',
-                background: step === 0 || step === 4 ? 'var(--accent-blue)' : 'var(--accent-orange)',
-                border: 'none',
-                color: 'white',
-                borderRadius: '8px',
-                fontSize: '0.9rem',
-                fontWeight: 700,
-                cursor: 'pointer',
-                boxShadow: '0 4px 14px 0 rgba(59, 130, 246, 0.39)',
-                marginBottom: '1rem'
-              }}
+              className="glass"
+              onClick={runScan}
+              disabled={isScanning}
+              style={{ marginTop: '2rem', width: '100%', padding: '1rem', border: '1px dashed var(--accent-blue)', color: 'var(--accent-blue)', cursor: isScanning ? 'wait' : 'pointer' }}
             >
-              {step === 0 ? 'SIMULAR INTENTO DE ACCESO' :
-                step === 1 ? 'ESCANEAR Y REPARAR (FIX)' :
-                  step === 2 ? 'SOLICITAR JIT (2 HORAS)' :
-                    step === 3 ? 'APROBAR (VISTA SUPERVISOR)' : 'CERRAR SESIÓN / FINALIZAR'}
+              {isScanning ? 'EJECUTANDO ESCANEO NMAP REAL...' : '+ INICIAR ESCANEO DE RED REAL (NMAP)'}
             </button>
-
-            {/* Live Message for the Action */}
-            <div className="glass" style={{ padding: '1rem', background: 'rgba(239, 68, 68, 0.05)', borderRadius: '8px', minHeight: '80px' }}>
-              <div style={{ fontSize: '0.7rem', opacity: 0.5, marginBottom: '0.5rem' }}>ESTADO DEL MOTOR DE ACCIÓN</div>
-              <div style={{ fontSize: '0.85rem', fontWeight: 500 }}>
-                {step === 0 && 'Esperando evento de inicio de sesión...'}
-                {step === 1 && 'SISTEMA: Acceso bloqueado. El laptop del técnico no cumple con el nivel de parches.'}
-                {step === 2 && 'SISTEMA: Salud validada. El técnico ahora puede pedir su ticket de acceso.'}
-                {step === 3 && 'PENDIENTE: El Supervisor ha recibido una notificación push para aprobar.'}
-                {step === 4 && 'ÉXITO: Túnel seguro abierto. Sesión grabada iniciada.'}
-              </div>
-            </div>
           </section>
 
-          {/* Activity Logs (Smaller) */}
+          <aside style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+            <section className="glass grid-bg" style={{ padding: '1.5rem', maxHeight: '480px', display: 'flex', flexDirection: 'column' }}>
+              <h2 style={{ marginBottom: '1.5rem', fontSize: '1rem' }}>Mapa de Riesgo: Vaca Muerta</h2>
+              <div style={{ flex: 1, minHeight: '220px', position: 'relative', background: 'rgba(0,0,0,0.2)', borderRadius: '8px' }}>
+                {activeThreats.slice(0, 5).map((t, i) => (
+                  <div key={t.id} style={{
+                    position: 'absolute',
+                    top: `${20 + (i * 15)}%`,
+                    left: `${30 + (i * 12)}%`,
+                    width: '12px', height: '12px',
+                    background: severityColor(t.severity),
+                    borderRadius: '50%',
+                    boxShadow: `0 0 15px ${severityColor(t.severity)}`,
+                    transition: 'all 0.5s ease',
+                  }}></div>
+                ))}
+                <div style={{ position: 'absolute', top: '50%', left: '70%', width: '10px', height: '10px', background: 'var(--accent-green)', borderRadius: '50%' }}></div>
+                <div style={{ fontSize: '0.7rem', opacity: 0.4, textAlign: 'center', width: '100%', marginTop: '110px' }}>[ MAPA DE NODOS GEOPOSICIONADOS ]</div>
+              </div>
+              <div style={{ marginTop: '1rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '0.5rem' }}>
+                  <span>Amenazas Activas</span>
+                  <span style={{ color: activeThreats.length > 0 ? '#ef4444' : 'var(--accent-green)' }}>{activeThreats.length}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem' }}>
+                  <span>Criticas</span>
+                  <span style={{ color: '#ef4444' }}>
+                    {activeThreats.filter(t => t.severity === 'critical' || t.severity === 'high').length}
+                  </span>
+                </div>
+              </div>
+            </section>
+
+            {/* Log en vivo */}
+            <section className="glass" style={{ padding: '1.5rem' }}>
+              <h2 style={{ marginBottom: '1rem', fontSize: '1rem' }}>Log del SOC</h2>
+              <div role="log" aria-live="polite" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                {logs.map((l, i) => (
+                  <div key={i} style={{ fontSize: '0.75rem', opacity: i === 0 ? 1 : 0.6 }}>
+                    <span style={{ color: l.type === 'alert' ? '#ef4444' : 'var(--accent-blue)' }}>[{l.time}]</span> {l.msg}
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            {/* Panel de detalles */}
+            {selectedThreat && (
+              <section className="glass cyber-border" style={{ padding: '1.5rem', background: 'rgba(239, 68, 68, 0.05)', border: '1px solid #ef4444' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1rem' }}>
+                  <h3 style={{ fontSize: '0.9rem', fontWeight: 700 }}>DETALLES TECNICOS</h3>
+                  <button onClick={() => setSelectedThreat(null)} style={{ background: 'none', border: 'none', color: 'white', cursor: 'pointer', opacity: 0.5 }}>X</button>
+                </div>
+                <div style={{ fontSize: '0.8rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  <div><strong>ID:</strong> <span style={{ fontFamily: 'monospace', fontSize: '0.7rem' }}>{selectedThreat.id}</span></div>
+                  <div><strong>IP ORIGEN:</strong> <span style={{ color: '#ef4444' }}>{selectedThreat.sourceIp}</span></div>
+                  <div><strong>DESTINO:</strong> {selectedThreat.targetAsset}</div>
+                  <div><strong>TIPO:</strong> {selectedThreat.type}</div>
+                  <div><strong>SEVERIDAD:</strong> <span style={{ color: severityColor(selectedThreat.severity) }}>{selectedThreat.severity.toUpperCase()}</span></div>
+                  {selectedThreat.protocol && <div><strong>PROTOCOLO:</strong> {selectedThreat.protocol}</div>}
+                  <div style={{ marginTop: '0.5rem', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '0.5rem' }}>
+                    <strong>ANALISIS DE RIESGO:</strong>
+                    <p style={{ opacity: 0.8, fontSize: '0.75rem', marginTop: '0.25rem' }}>
+                      {selectedThreat.riskAnalysis || selectedThreat.description}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => { mitigateThreat(selectedThreat.id); setSelectedThreat(null) }}
+                    style={{ marginTop: '1rem', width: '100%', padding: '0.75rem', background: 'var(--accent-green)', color: 'white', border: 'none', borderRadius: '4px', fontWeight: 700, cursor: 'pointer' }}
+                  >
+                    MITIGAR AHORA
+                  </button>
+                </div>
+              </section>
+            )}
+          </aside>
+        </div>
+      )}
+
+      {/* ═══════════ ACCESO JIT ═══════════ */}
+      {activeTab === 'jit' && (
+        <div role="tabpanel" style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '1.5rem' }}>
+          <section className="glass" style={{ padding: '2rem' }}>
+            <h2 style={{ marginBottom: '1.5rem', fontSize: '1.25rem' }}>Simulador de Acceso JIT</h2>
+            <p style={{ opacity: 0.7, marginBottom: '2rem' }}>Flujo de autorizacion para tareas de mantenimiento de terceros.</p>
+            <div role="progressbar" aria-valuemin={0} aria-valuemax={4} aria-valuenow={jitStep} style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '1rem', marginBottom: '3rem' }}>
+              {[
+                { id: 1, label: 'Intento' },
+                { id: 2, label: 'Validacion' },
+                { id: 3, label: 'Solicitud' },
+                { id: 4, label: 'Acceso' },
+              ].map(s => (
+                <div key={s.id} style={{ textAlign: 'center', opacity: jitStep >= s.id ? 1 : 0.3 }}>
+                  <div style={{ width: '40px', height: '40px', background: jitStep >= s.id ? 'var(--accent-blue)' : 'var(--border-color)', borderRadius: '50%', margin: '0 auto 0.5rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{s.id}</div>
+                  <div style={{ fontSize: '0.7rem' }}>{s.label}</div>
+                </div>
+              ))}
+            </div>
+            <button
+              onClick={runWorkflow}
+              style={{ width: '100%', padding: '1rem', background: 'var(--accent-blue)', color: 'white', border: 'none', borderRadius: '8px', fontWeight: 600, cursor: 'pointer' }}
+            >
+              {jitStep === 0 ? 'INICIAR FLUJO JIT' : 'SIGUIENTE PASO'}
+            </button>
+          </section>
           <section className="glass" style={{ padding: '1.5rem' }}>
-            <h2 style={{ marginBottom: '1rem', fontSize: '0.9rem', opacity: 0.6 }}>LOGS DE AUDITORÍA</h2>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-              {logs.map((log, i) => (
-                <div key={i} style={{ fontSize: '0.75rem' }}>
-                  <span style={{ color: log.type === 'alert' ? '#ef4444' : 'var(--accent-blue)' }}>[{log.time}]</span> {log.msg}
+            <h2 style={{ marginBottom: '1rem', fontSize: '1.1rem' }}>Logs de Accion</h2>
+            <div role="log" aria-live="polite" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              {logs.map((l, i) => (
+                <div key={i} style={{ fontSize: '0.8rem' }}>
+                  <span className="threat-low">[{l.time}]</span> {l.msg}
                 </div>
               ))}
             </div>
           </section>
         </div>
-      </div>
+      )}
+
+      {/* ═══════════ REPORTES ═══════════ */}
+      {activeTab === 'reports' && (
+        <section role="tabpanel" className="glass" style={{ padding: '3rem', textAlign: 'center' }}>
+          <h2 style={{ fontSize: '1.5rem', marginBottom: '1rem' }}>Generacion de Reportes de Cumplimiento</h2>
+          <p style={{ opacity: 0.6, marginBottom: '2rem' }}>Modulo de evidencias automaticas para Auditoria Ley 25.326.</p>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.5rem', maxWidth: '800px', margin: '0 auto' }}>
+            <button className="glass highlight-on-hover" style={{ padding: '2rem', border: 'none', cursor: 'pointer', background: 'rgba(255,255,255,0.03)', color: 'white' }}>Audit Mensual</button>
+            <button className="glass highlight-on-hover" style={{ padding: '2rem', border: 'none', cursor: 'pointer', background: 'rgba(255,255,255,0.03)', color: 'white' }}>Incidente Feb</button>
+            <button className="glass highlight-on-hover" style={{ padding: '2rem', border: 'none', cursor: 'pointer', background: 'rgba(255,255,255,0.03)', color: 'white' }}>Health Check</button>
+          </div>
+        </section>
+      )}
     </div>
   )
 }

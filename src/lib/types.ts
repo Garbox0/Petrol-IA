@@ -5,8 +5,31 @@ export interface User {
     passwordHash: string;
     role: string;
     contractorId?: string;
+    organizationId?: string; // Multi-tenancy support
     createdAt: string;
     updatedAt: string;
+}
+
+export interface Organization {
+    id: string;
+    name: string;
+    slug: string; // para URLs amigables
+    plan: 'starter' | 'pro' | 'enterprise';
+    status: 'active' | 'suspended';
+    contactEmail: string;
+    createdAt: string;
+    licenseKey?: string;
+}
+
+export interface EnrollmentToken {
+    id: string;
+    token: string;
+    organizationId: string;
+    organizationName?: string; // Helper para UI
+    expiresAt: string;
+    createdBy: string;
+    usedCount: number;
+    maxUses: number;
 }
 
 export interface Contractor {

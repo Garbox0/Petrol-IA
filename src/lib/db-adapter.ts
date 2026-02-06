@@ -267,7 +267,15 @@ export const prisma = {
                 throw error;
             }
         },
-        findFirst: async ({ where }: { where: { status?: string } }): Promise<Job | null> => {
+        findUnique: async ({ where, include, select }: any): Promise<Job | null> => {
+            try {
+                return (db.prepare('SELECT * FROM Job WHERE id = ?').get(where.id) as Job) || null;
+            } catch (error) {
+                console.error('[DB] job.findUnique error:', error);
+                throw error;
+            }
+        },
+        findFirst: async ({ where, orderBy, include, select }: any): Promise<Job | null> => {
             try {
                 if (where?.status) {
                     return (db.prepare('SELECT * FROM Job WHERE status = ? ORDER BY createdAt ASC LIMIT 1').get(where.status) as Job) || null;

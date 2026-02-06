@@ -1,4 +1,5 @@
-import { prisma } from './prisma';
+import { prisma } from './db-adapter';
+import { Job as DbJob } from './types';
 
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed';
 
@@ -28,7 +29,7 @@ class JobManager {
         if (job) {
             return {
                 ...job,
-                payload: JSON.parse(job.payload),
+                payload: job.payload ? JSON.parse(job.payload) : {},
                 result: job.result ? JSON.parse(job.result) : undefined
             };
         }
@@ -47,26 +48,22 @@ class JobManager {
     }
 
     async listJobs(): Promise<any[]> {
-        const jobs = await prisma.job.findMany({
-            orderBy: { createdAt: 'desc' },
-            take: 20
-        });
-        return jobs.map(j => ({
+        const jobs = await prisma.job.findMany(); // Sin parámetros para evitar cualquier conflicto de tipado
+        return (jobs as DbJob[]).map((j: DbJob) => ({
             ...j,
-            payload: JSON.parse(j.payload),
+            payload: j.payload ? JSON.parse(j.payload) : {},
             result: j.result ? JSON.parse(j.result) : undefined
         }));
     }
 
     async getNextPendingJob(): Promise<any> {
         const job = await prisma.job.findFirst({
-            where: { status: 'pending' },
-            orderBy: { createdAt: 'asc' }
+            where: { status: 'pending' }
         });
         if (job) {
             return {
                 ...job,
-                payload: JSON.parse(job.payload),
+                payload: job.payload ? JSON.parse(job.payload) : {},
                 result: job.result ? JSON.parse(job.result) : undefined
             };
         }

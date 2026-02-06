@@ -1,7 +1,8 @@
 'use client'
 
-import React, { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useSession, signOut } from 'next-auth/react'
+import TacticalRadar from '@/components/TacticalRadar'
 
 interface Threat {
   id: string
@@ -52,16 +53,36 @@ export default function Dashboard() {
   const [networkData, setNetworkData] = useState<number[]>([])
   const [isScanning, setIsScanning] = useState(false)
   const [logs, setLogs] = useState<LogEntry[]>([
-    { time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), msg: 'Sistema SOC Inicializado.', type: 'system' }
+    { time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), msg: 'Sistema SOC Inicializado (Modo Real). Sin amenazas detectadas.', type: 'system' }
   ])
 
-  // JIT workflow state
   const [jitStep, setJitStep] = useState(0)
+  const [threatIntel, setThreatIntel] = useState<any>(null)
+  const [location, setLocation] = useState<any>(null)
+  // sonarAngle y hoveredNode ahora son internos del componente TacticalRadar
+  const [radarDevices, setRadarDevices] = useState<any[]>([])
+  const [detectionRunning, setDetectionRunning] = useState(false)
+  const [lastDetection, setLastDetection] = useState<any>(null)
+  const [maxDistanceKm, setMaxDistanceKm] = useState(0)
 
   const addLog = useCallback((msg: string, type: string = 'system') => {
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     setLogs(prev => [{ time, msg, type }, ...prev].slice(0, 10))
   }, [])
+
+  // Geolocalización real
+  useEffect(() => {
+    fetch('https://ipapi.co/json/')
+      .then(res => res.json())
+      .then(data => {
+        setLocation(data)
+        addLog(`Ubicación detectada: ${data.city}, ${data.country_name}`, 'system')
+      })
+      .catch(() => {
+        setLocation({ city: 'Buenos Aires', lat: -34.60, lon: -58.38 })
+        addLog('Ubicación predeterminada: Buenos Aires (Sede Central)', 'system')
+      })
+  }, [addLog])
 
   // Fetch amenazas reales de la DB
   const fetchThreats = useCallback(async () => {
@@ -103,57 +124,101 @@ export default function Dashboard() {
     }
   }, [])
 
-  // Polling de threat intel real
+  // Polling de threat intel real (Informativo)
   const fetchThreatIntel = useCallback(async () => {
     try {
       const res = await fetch('/api/threat-intel')
       const intel = await res.json()
-      if (intel.feed && intel.feed.length > 0) {
-        const ioc = intel.feed[Math.floor(Math.random() * intel.feed.length)]
-
-        // Crear amenaza real en la DB
-        const createRes = await fetch('/api/threats', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            type: ioc.type || 'IOC Detected',
-            description: ioc.description || `IOC detectado desde feed de inteligencia: ${ioc.source}`,
-            severity: ioc.severity || 'high',
-            sourceIp: ioc.source,
-            targetAsset: ioc.target || 'Edge-Firewall',
-            protocol: 'TCP',
-          }),
-        })
-
-        if (createRes.ok) {
-          addLog(`IOC Detectado: ${ioc.source}`, 'alert')
-          fetchThreats()
-        }
-      }
+      setThreatIntel(intel)
     } catch (e) {
       console.error('Error fetching threat intel:', e)
     }
-  }, [addLog, fetchThreats])
+  }, [])
+
+  // Ejecutar ciclo de detección real
+  const runDetection = useCallback(async () => {
+    if (detectionRunning) return
+    setDetectionRunning(true)
+    try {
+      const res = await fetch('/api/detection/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lat: location?.lat, lon: location?.lon }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setLastDetection(data.detection)
+        if (data.detection?.threatsCreated > 0) {
+          addLog(`Motor de detección: ${data.detection.threatsCreated} amenaza(s) detectada(s) en ${data.detection.connectionsAnalyzed} conexiones`, 'alert')
+          fetchThreats()
+          fetchStats()
+        } else {
+          addLog(`Escaneo completado: ${data.detection?.connectionsAnalyzed || 0} conexiones analizadas. Sin amenazas nuevas.`, 'system')
+        }
+        if (data.discovery?.maxDistanceKm > 0) {
+          setMaxDistanceKm(data.discovery.maxDistanceKm)
+          addLog(`Alcance geográfico de conexiones: ${Math.round(data.discovery.maxDistanceKm).toLocaleString()} km`, 'system')
+        }
+        if (data.discovery?.newDevices > 0) {
+          addLog(`Descubrimiento de red: ${data.discovery.newDevices} dispositivo(s) nuevo(s) encontrado(s)`, 'system')
+        }
+      }
+    } catch (e) {
+      console.error('Detection error:', e)
+    } finally {
+      setDetectionRunning(false)
+    }
+  }, [detectionRunning, addLog, fetchThreats, fetchStats, location])
+
+  // Fetch dispositivos reales para el radar
+  const fetchRadarDevices = useCallback(async () => {
+    try {
+      const res = await fetch('/api/detection/scan')
+      if (res.ok) {
+        const data = await res.json()
+        if (data.radarDevices) {
+          setRadarDevices(data.radarDevices)
+        }
+        if (data.maxDistanceKm > 0) {
+          setMaxDistanceKm(data.maxDistanceKm)
+        }
+      }
+    } catch (e) {
+      // Silenciar
+    }
+  }, [])
 
   // Polling principal
   useEffect(() => {
     fetchThreats()
     fetchStats()
     fetchTraffic()
+    fetchRadarDevices()
 
     const interval = setInterval(() => {
       fetchThreats()
       fetchStats()
       fetchTraffic()
-
-      // Threat intel cada ~20 segundos (cuando estamos en SOC tab)
-      if (activeTab === 'soc' && Math.random() > 0.5) {
-        fetchThreatIntel()
-      }
+      fetchRadarDevices()
     }, 6000)
 
     return () => clearInterval(interval)
-  }, [activeTab, fetchThreats, fetchStats, fetchTraffic, fetchThreatIntel])
+  }, [activeTab, fetchThreats, fetchStats, fetchTraffic, fetchThreatIntel, fetchRadarDevices])
+
+  // Ciclo de detección automático cada 30 segundos
+  useEffect(() => {
+    // Ejecutar primera detección al cargar
+    const timer = setTimeout(() => runDetection(), 3000)
+
+    const detectionInterval = setInterval(() => {
+      runDetection()
+    }, 30000)
+
+    return () => {
+      clearTimeout(timer)
+      clearInterval(detectionInterval)
+    }
+  }, [runDetection])
 
   // Mitigar amenaza REAL
   const mitigateThreat = async (id: string) => {
@@ -446,89 +511,130 @@ export default function Dashboard() {
               </div>
             </div>
 
-            <button
-              className="glass"
-              onClick={runScan}
-              disabled={isScanning}
-              style={{ marginTop: '2rem', width: '100%', padding: '1rem', border: '1px dashed var(--accent-blue)', color: 'var(--accent-blue)', cursor: isScanning ? 'wait' : 'pointer' }}
-            >
-              {isScanning ? 'EJECUTANDO ESCANEO NMAP REAL...' : '+ INICIAR ESCANEO DE RED REAL (NMAP)'}
-            </button>
+            <div style={{ display: 'flex', gap: '0.75rem', marginTop: '2rem' }}>
+              <button
+                className="glass"
+                onClick={runDetection}
+                disabled={detectionRunning}
+                style={{ flex: 1, padding: '1rem', border: '1px dashed var(--accent-green)', color: 'var(--accent-green)', cursor: detectionRunning ? 'wait' : 'pointer', fontWeight: 600 }}
+              >
+                {detectionRunning ? 'ANALIZANDO RED...' : 'EJECUTAR DETECCIÓN GEO-IP'}
+              </button>
+              <button
+                className="glass"
+                onClick={runScan}
+                disabled={isScanning}
+                style={{ flex: 1, padding: '1rem', border: '1px dashed var(--accent-blue)', color: 'var(--accent-blue)', cursor: isScanning ? 'wait' : 'pointer' }}
+              >
+                {isScanning ? 'NMAP EN CURSO...' : 'ESCANEO DE RED LOCAL'}
+              </button>
+            </div>
+            {lastDetection && (
+              <div style={{ marginTop: '0.75rem', fontSize: '0.7rem', opacity: 0.5, display: 'flex', gap: '1.5rem', justifyContent: 'center' }}>
+                <span>Conexiones: {lastDetection.connectionsAnalyzed}</span>
+                <span>IPs públicas: {lastDetection.publicIpsFound}</span>
+                <span>Duración: {lastDetection.durationMs}ms</span>
+                <span>Último: {new Date(lastDetection.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+              </div>
+            )}
           </section>
 
           <aside style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-            <section className="glass grid-bg" style={{ padding: '1.5rem', maxHeight: '480px', display: 'flex', flexDirection: 'column' }}>
-              <h2 style={{ marginBottom: '1.5rem', fontSize: '1rem' }}>Mapa de Riesgo: Vaca Muerta</h2>
-              <div style={{ flex: 1, minHeight: '220px', position: 'relative', background: 'rgba(0,0,0,0.2)', borderRadius: '8px' }}>
-                {activeThreats.slice(0, 5).map((t, i) => (
-                  <div key={t.id} style={{
-                    position: 'absolute',
-                    top: `${20 + (i * 15)}%`,
-                    left: `${30 + (i * 12)}%`,
-                    width: '12px', height: '12px',
-                    background: severityColor(t.severity),
-                    borderRadius: '50%',
-                    boxShadow: `0 0 15px ${severityColor(t.severity)}`,
-                    transition: 'all 0.5s ease',
-                  }}></div>
-                ))}
-                <div style={{ position: 'absolute', top: '50%', left: '70%', width: '10px', height: '10px', background: 'var(--accent-green)', borderRadius: '50%' }}></div>
-                <div style={{ fontSize: '0.7rem', opacity: 0.4, textAlign: 'center', width: '100%', marginTop: '110px' }}>[ MAPA DE NODOS GEOPOSICIONADOS ]</div>
-              </div>
-              <div style={{ marginTop: '1rem' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '0.5rem' }}>
-                  <span>Amenazas Activas</span>
-                  <span style={{ color: activeThreats.length > 0 ? '#ef4444' : 'var(--accent-green)' }}>{activeThreats.length}</span>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem' }}>
-                  <span>Criticas</span>
-                  <span style={{ color: '#ef4444' }}>
-                    {activeThreats.filter(t => t.severity === 'critical' || t.severity === 'high').length}
-                  </span>
-                </div>
-              </div>
-            </section>
+            <TacticalRadar
+              devices={radarDevices}
+              threats={activeThreats}
+              location={location}
+              detectionRunning={detectionRunning}
+              maxDistanceKm={maxDistanceKm}
+            />
 
             {/* Log en vivo */}
-            <section className="glass" style={{ padding: '1.5rem' }}>
-              <h2 style={{ marginBottom: '1rem', fontSize: '1rem' }}>Log del SOC</h2>
-              <div role="log" aria-live="polite" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+            <section className="glass" style={{ padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+              <h2 style={{ fontSize: '0.9rem', opacity: 0.8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Log del SOC</h2>
+              <div role="log" aria-live="polite" style={{ height: '180px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem', paddingRight: '0.5rem' }}>
                 {logs.map((l, i) => (
-                  <div key={i} style={{ fontSize: '0.75rem', opacity: i === 0 ? 1 : 0.6 }}>
-                    <span style={{ color: l.type === 'alert' ? '#ef4444' : 'var(--accent-blue)' }}>[{l.time}]</span> {l.msg}
+                  <div key={i} style={{ fontSize: '0.75rem', opacity: i === 0 ? 1 : 0.6, borderLeft: '1px solid var(--border-color)', paddingLeft: '0.5rem' }}>
+                    <span style={{ color: l.type === 'alert' ? '#ef4444' : 'var(--accent-blue)', fontWeight: 600 }}>[{l.time}]</span> {l.msg}
                   </div>
                 ))}
               </div>
             </section>
 
-            {/* Panel de detalles */}
+            {/* Panel de detalles FLOTANTE */}
             {selectedThreat && (
-              <section className="glass cyber-border" style={{ padding: '1.5rem', background: 'rgba(239, 68, 68, 0.05)', border: '1px solid #ef4444' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1rem' }}>
-                  <h3 style={{ fontSize: '0.9rem', fontWeight: 700 }}>DETALLES TECNICOS</h3>
-                  <button onClick={() => setSelectedThreat(null)} style={{ background: 'none', border: 'none', color: 'white', cursor: 'pointer', opacity: 0.5 }}>X</button>
-                </div>
-                <div style={{ fontSize: '0.8rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                  <div><strong>ID:</strong> <span style={{ fontFamily: 'monospace', fontSize: '0.7rem' }}>{selectedThreat.id}</span></div>
-                  <div><strong>IP ORIGEN:</strong> <span style={{ color: '#ef4444' }}>{selectedThreat.sourceIp}</span></div>
-                  <div><strong>DESTINO:</strong> {selectedThreat.targetAsset}</div>
-                  <div><strong>TIPO:</strong> {selectedThreat.type}</div>
-                  <div><strong>SEVERIDAD:</strong> <span style={{ color: severityColor(selectedThreat.severity) }}>{selectedThreat.severity.toUpperCase()}</span></div>
-                  {selectedThreat.protocol && <div><strong>PROTOCOLO:</strong> {selectedThreat.protocol}</div>}
-                  <div style={{ marginTop: '0.5rem', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '0.5rem' }}>
-                    <strong>ANALISIS DE RIESGO:</strong>
-                    <p style={{ opacity: 0.8, fontSize: '0.75rem', marginTop: '0.25rem' }}>
+              <div style={{
+                position: 'fixed',
+                bottom: '2rem',
+                right: '2rem',
+                width: '380px',
+                zIndex: 100,
+                animation: 'slideIn 0.3s ease-out'
+              }}>
+                <section className="glass cyber-border" style={{
+                  padding: '1.5rem',
+                  background: 'rgba(10, 10, 12, 0.95)',
+                  border: `1px solid ${severityColor(selectedThreat.severity)}`,
+                  boxShadow: `0 20px 40px rgba(0,0,0,0.4), 0 0 20px ${severityColor(selectedThreat.severity)}22`
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.25rem' }}>
+                    <div>
+                      <h3 style={{ fontSize: '1rem', fontWeight: 700, color: severityColor(selectedThreat.severity) }}>
+                        DETALLES: {selectedThreat.type.toUpperCase()}
+                      </h3>
+                      <p style={{ fontSize: '0.7rem', opacity: 0.5, fontFamily: 'monospace' }}>ID: {selectedThreat.id}</p>
+                    </div>
+                    <button
+                      onClick={() => setSelectedThreat(null)}
+                      style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: 'white', cursor: 'pointer', padding: '0.4rem', borderRadius: '4px' }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginBottom: '1.5rem' }}>
+                    <div className="glass" style={{ padding: '0.75rem', background: 'rgba(255,255,255,0.02)' }}>
+                      <div style={{ fontSize: '0.65rem', opacity: 0.5, marginBottom: '0.25rem' }}>ORIGEN (IP)</div>
+                      <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#ef4444' }}>{selectedThreat.sourceIp}</div>
+                    </div>
+                    <div className="glass" style={{ padding: '0.75rem', background: 'rgba(255,255,255,0.02)' }}>
+                      <div style={{ fontSize: '0.65rem', opacity: 0.5, marginBottom: '0.25rem' }}>DESTINO</div>
+                      <div style={{ fontSize: '0.85rem', fontWeight: 600 }}>{selectedThreat.targetAsset}</div>
+                    </div>
+                    <div className="glass" style={{ padding: '0.75rem', background: 'rgba(255,255,255,0.02)' }}>
+                      <div style={{ fontSize: '0.65rem', opacity: 0.5, marginBottom: '0.25rem' }}>SEVERIDAD</div>
+                      <div style={{ fontSize: '0.85rem', fontWeight: 600, color: severityColor(selectedThreat.severity) }}>{selectedThreat.severity.toUpperCase()}</div>
+                    </div>
+                    <div className="glass" style={{ padding: '0.75rem', background: 'rgba(255,255,255,0.02)' }}>
+                      <div style={{ fontSize: '0.65rem', opacity: 0.5, marginBottom: '0.25rem' }}>PROTOCOLO</div>
+                      <div style={{ fontSize: '0.85rem', fontWeight: 600 }}>{selectedThreat.protocol || 'TCP'}</div>
+                    </div>
+                  </div>
+
+                  <div style={{ marginBottom: '1.5rem' }}>
+                    <div style={{ fontSize: '0.7rem', opacity: 0.5, marginBottom: '0.5rem' }}>ANÁLISIS DE RIESGO</div>
+                    <p style={{ fontSize: '0.8rem', opacity: 0.9, lineHeight: '1.4' }}>
                       {selectedThreat.riskAnalysis || selectedThreat.description}
                     </p>
                   </div>
+
                   <button
                     onClick={() => { mitigateThreat(selectedThreat.id); setSelectedThreat(null) }}
-                    style={{ marginTop: '1rem', width: '100%', padding: '0.75rem', background: 'var(--accent-green)', color: 'white', border: 'none', borderRadius: '4px', fontWeight: 700, cursor: 'pointer' }}
+                    style={{
+                      width: '100%',
+                      padding: '1rem',
+                      background: severityColor(selectedThreat.severity),
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '8px',
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                      boxShadow: `0 4px 12px ${severityColor(selectedThreat.severity)}44`
+                    }}
                   >
-                    MITIGAR AHORA
+                    MITIGAR AMENAZA AHORA
                   </button>
-                </div>
-              </section>
+                </section>
+              </div>
             )}
           </aside>
         </div>

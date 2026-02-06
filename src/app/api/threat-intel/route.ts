@@ -28,14 +28,10 @@ export async function GET() {
 
         // Fallback: Si no hay API KEY, usamos una simulación que avisa al usuario
         // Pero con datos extraídos de un feed público (simulado aquí para el demo)
-        const feed = [
-            { id: 'public-1', type: 'IOC (Emerging Threats)', source: '45.155.205.233', severity: 'high', target: 'Gateway', description: 'Detectado en lista de IPs comprometidas de ET.' },
-            { id: 'public-2', type: 'IOC (Botnet Tracking)', source: '185.224.128.89', severity: 'high', target: 'Plant-Network', description: 'Actividad de C2 reportada recientemente.' },
-        ];
-
         return NextResponse.json({
-            feed,
-            source: 'Internal (Add ABUSE_IPDB_KEY to .env for Real-time global data)',
+            feed: [],
+            source: 'Internal (Add ABUSE_IPDB_KEY for global data)',
+            message: 'Waiting for live data feed...',
             updatedAt: new Date().toISOString()
         });
     } catch (error) {
